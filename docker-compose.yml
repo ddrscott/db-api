@@ -2,10 +2,10 @@ services:
   api:
     build: .
     ports:
-      - "8080:8080"
+      - "8013:8013"
     environment:
       - HOST=0.0.0.0
-      - PORT=8080
+      - PORT=8013
       - INACTIVITY_TIMEOUT_SECS=1800
       - QUERY_TIMEOUT_SECS=60
       - CONTAINER_MEMORY_MB=2048
