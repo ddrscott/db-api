@@ -39,6 +39,15 @@ pub struct DiscoveredContainer {
     pub is_running: bool,
 }
 
+/// Discovered pool container info
+#[derive(Debug)]
+pub struct DiscoveredPoolContainer {
+    pub container_id: String,
+    pub dialect: String,
+    pub host_port: u16,
+    pub is_running: bool,
+}
+
 impl DockerManager {
     pub fn new() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()?;
@@ -393,6 +402,180 @@ impl DockerManager {
     pub async fn is_running(&self, container_id: &str) -> Result<bool> {
         let inspect = self.docker.inspect_container(container_id, None).await?;
         Ok(inspect.state.and_then(|s| s.running).unwrap_or(false))
+    }
+
+    /// Check if a container exists (running or not)
+    pub async fn container_exists(&self, container_id: &str) -> bool {
+        self.docker.inspect_container(container_id, None).await.is_ok()
+    }
+
+    /// Create a pool container for a dialect
+    pub async fn create_pool_container(
+        &self,
+        dialect_name: &str,
+        image: &str,
+        env_vars: Vec<(String, String)>,
+        container_port: u16,
+        memory_limit_mb: u32,
+    ) -> Result<(String, u16)> {
+        let container_name = format!("db-api-pool-{}", dialect_name);
+
+        // Check if image exists locally, pull if not
+        if self.docker.inspect_image(image).await.is_err() {
+            self.pull_image(image).await?;
+        }
+
+        let env: Vec<String> = env_vars
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+
+        let port_key = format!("{}/tcp", container_port);
+        let mut port_bindings = HashMap::new();
+        port_bindings.insert(
+            port_key.clone(),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some("0".to_string()), // Let Docker assign a port
+            }]),
+        );
+
+        let host_config = HostConfig {
+            port_bindings: Some(port_bindings),
+            memory: Some((memory_limit_mb as i64) * 1024 * 1024),
+            ..Default::default()
+        };
+
+        let mut exposed_ports = HashMap::new();
+        exposed_ports.insert(port_key.clone(), HashMap::new());
+
+        // Labels for pool container identification
+        let mut labels = HashMap::new();
+        labels.insert("db-api.pool".to_string(), "true".to_string());
+        labels.insert("db-api.dialect".to_string(), dialect_name.to_string());
+        labels.insert("db-api.container_port".to_string(), container_port.to_string());
+
+        let config = Config {
+            image: Some(image.to_string()),
+            env: Some(env),
+            exposed_ports: Some(exposed_ports),
+            host_config: Some(host_config),
+            labels: Some(labels),
+            ..Default::default()
+        };
+
+        let options = CreateContainerOptions {
+            name: &container_name,
+            platform: None,
+        };
+
+        let response = self.docker.create_container(Some(options), config).await?;
+        let container_id = response.id;
+
+        info!("Created pool container: {} ({})", container_name, container_id);
+
+        // Start the container
+        self.docker
+            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .await?;
+
+        info!("Started pool container: {}", container_id);
+
+        // Get the assigned host port
+        let inspect = self.docker.inspect_container(&container_id, None).await?;
+        let host_port = inspect
+            .network_settings
+            .and_then(|ns| ns.ports)
+            .and_then(|ports| ports.get(&format!("{}/tcp", container_port)).cloned())
+            .flatten()
+            .and_then(|bindings| bindings.first().cloned())
+            .and_then(|binding| binding.host_port)
+            .and_then(|port| port.parse::<u16>().ok())
+            .ok_or_else(|| AppError::Internal("Failed to get pool container port".to_string()))?;
+
+        info!("Pool container {} mapped to host port {}", container_id, host_port);
+
+        Ok((container_id, host_port))
+    }
+
+    /// List all db-api pool containers
+    pub async fn list_pool_containers(&self) -> Result<Vec<DiscoveredPoolContainer>> {
+        use bollard::container::ListContainersOptions;
+
+        let mut filters = HashMap::new();
+        filters.insert("name", vec!["db-api-pool-"]);
+
+        let options = ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        };
+
+        let containers = self.docker.list_containers(Some(options)).await?;
+        let mut result = Vec::new();
+
+        for container in containers {
+            let container_id = match &container.id {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+
+            let inspect = match self.docker.inspect_container(&container_id, None).await {
+                Ok(i) => i,
+                Err(e) => {
+                    warn!("Failed to inspect pool container {}: {}", container_id, e);
+                    continue;
+                }
+            };
+
+            let labels = inspect.config.as_ref().and_then(|c| c.labels.as_ref());
+
+            // Check if it's a pool container
+            let is_pool = labels
+                .and_then(|l| l.get("db-api.pool"))
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+            if !is_pool {
+                continue;
+            }
+
+            let dialect = match labels.and_then(|l| l.get("db-api.dialect")) {
+                Some(d) => d.clone(),
+                None => continue,
+            };
+
+            let container_port_str = labels.and_then(|l| l.get("db-api.container_port"));
+            let container_port: u16 = container_port_str
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3306);
+
+            let host_port = inspect
+                .network_settings
+                .as_ref()
+                .and_then(|ns| ns.ports.as_ref())
+                .and_then(|ports| ports.get(&format!("{}/tcp", container_port)))
+                .and_then(|bindings| bindings.as_ref())
+                .and_then(|bindings| bindings.first())
+                .and_then(|binding| binding.host_port.as_ref())
+                .and_then(|port| port.parse::<u16>().ok())
+                .unwrap_or(0);
+
+            let is_running = inspect
+                .state
+                .as_ref()
+                .and_then(|s| s.running)
+                .unwrap_or(false);
+
+            result.push(DiscoveredPoolContainer {
+                container_id,
+                dialect,
+                host_port,
+                is_running,
+            });
+        }
+
+        Ok(result)
     }
 
     /// List all db-api containers and extract their metadata

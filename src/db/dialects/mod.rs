@@ -69,6 +69,32 @@ pub trait Dialect: Send + Sync {
     fn restore_command(&self, _db_name: &str, _user: &str, _password: &str) -> (String, Vec<String>) {
         ("cat".to_string(), vec![])
     }
+
+    // Pool container methods - for running multiple databases in one container
+
+    /// SQL to create a database inside the pool container
+    fn create_database_sql(&self, db_name: &str) -> String;
+
+    /// SQL to drop a database inside the pool container
+    fn drop_database_sql(&self, db_name: &str) -> String;
+
+    /// SQL to create a user with permissions on a database
+    fn create_user_sql(&self, user: &str, password: &str, db_name: &str) -> String;
+
+    /// SQL to drop a user
+    fn drop_user_sql(&self, user: &str) -> String;
+
+    /// Root user name for administrative operations
+    fn root_user(&self) -> &str;
+
+    /// Environment variable name for root password
+    fn root_password_env(&self) -> &str;
+
+    /// Environment variables for pool container startup (root password only)
+    fn pool_env_vars(&self, root_password: &str) -> Vec<(String, String)>;
+
+    /// Build command to execute SQL as root user inside the container
+    fn exec_sql_command(&self, root_password: &str, sql: &str) -> (String, Vec<String>);
 }
 
 /// Get a dialect implementation by name

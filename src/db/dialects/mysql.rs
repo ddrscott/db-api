@@ -107,4 +107,52 @@ impl Dialect for MySqlDialect {
             vec!["-u".to_string(), user.to_string(), db_name.to_string()],
         )
     }
+
+    // Pool container methods
+
+    fn create_database_sql(&self, db_name: &str) -> String {
+        format!("CREATE DATABASE `{}`", db_name)
+    }
+
+    fn drop_database_sql(&self, db_name: &str) -> String {
+        format!("DROP DATABASE IF EXISTS `{}`", db_name)
+    }
+
+    fn create_user_sql(&self, user: &str, password: &str, db_name: &str) -> String {
+        format!(
+            "CREATE USER '{}'@'%' IDENTIFIED BY '{}'; GRANT ALL PRIVILEGES ON `{}`.* TO '{}'@'%'; FLUSH PRIVILEGES;",
+            user, password, db_name, user
+        )
+    }
+
+    fn drop_user_sql(&self, user: &str) -> String {
+        format!("DROP USER IF EXISTS '{}'@'%'", user)
+    }
+
+    fn root_user(&self) -> &str {
+        "root"
+    }
+
+    fn root_password_env(&self) -> &str {
+        "MYSQL_ROOT_PASSWORD"
+    }
+
+    fn pool_env_vars(&self, root_password: &str) -> Vec<(String, String)> {
+        vec![
+            ("MYSQL_ROOT_PASSWORD".to_string(), root_password.to_string()),
+        ]
+    }
+
+    fn exec_sql_command(&self, root_password: &str, sql: &str) -> (String, Vec<String>) {
+        (
+            "mysql".to_string(),
+            vec![
+                "-u".to_string(),
+                "root".to_string(),
+                format!("-p{}", root_password),
+                "-e".to_string(),
+                sql.to_string(),
+            ],
+        )
+    }
 }

@@ -35,6 +35,17 @@ impl InstanceState {
     }
 }
 
+/// Pool container data stored in SQLite
+#[derive(Debug, Clone)]
+pub struct PoolContainer {
+    pub dialect: String,
+    pub container_id: String,
+    pub host_port: u16,
+    pub root_password: String,
+    pub created_at: DateTime<Utc>,
+    pub status: String, // 'running', 'starting', 'failed'
+}
+
 /// Instance data stored in SQLite
 #[derive(Debug, Clone)]
 pub struct StoredInstance {
@@ -92,6 +103,15 @@ impl MetadataStore {
 
             CREATE INDEX IF NOT EXISTS idx_instances_status ON instances(status);
             CREATE INDEX IF NOT EXISTS idx_instances_last_activity ON instances(last_activity);
+
+            CREATE TABLE IF NOT EXISTS pool_containers (
+                dialect TEXT PRIMARY KEY,
+                container_id TEXT NOT NULL,
+                host_port INTEGER NOT NULL,
+                root_password TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
             "#,
         )
         .map_err(|e| AppError::Storage(format!("Failed to initialize schema: {}", e)))?;
@@ -351,5 +371,119 @@ impl MetadataStore {
             backup_key: row.get(11)?,
             backup_size_bytes: row.get(12)?,
         })
+    }
+
+    // Pool container methods
+
+    /// Insert or update a pool container
+    pub fn upsert_pool_container(&self, pool: &PoolContainer) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO pool_containers (
+                dialect, container_id, host_port, root_password, created_at, status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                pool.dialect,
+                pool.container_id,
+                pool.host_port,
+                pool.root_password,
+                pool.created_at.to_rfc3339(),
+                pool.status,
+            ],
+        )
+        .map_err(|e| AppError::Storage(format!("Failed to upsert pool container: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Get a pool container by dialect
+    pub fn get_pool_container(&self, dialect: &str) -> Result<Option<PoolContainer>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT dialect, container_id, host_port, root_password, created_at, status
+                FROM pool_containers WHERE dialect = ?1
+                "#,
+            )
+            .map_err(|e| AppError::Storage(format!("Failed to prepare query: {}", e)))?;
+
+        let result = stmt
+            .query_row(params![dialect], |row| {
+                let created_at_str: String = row.get(4)?;
+                Ok(PoolContainer {
+                    dialect: row.get(0)?,
+                    container_id: row.get(1)?,
+                    host_port: row.get(2)?,
+                    root_password: row.get(3)?,
+                    created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    status: row.get(5)?,
+                })
+            })
+            .optional()
+            .map_err(|e| AppError::Storage(format!("Failed to query pool container: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// Delete a pool container
+    pub fn delete_pool_container(&self, dialect: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pool_containers WHERE dialect = ?1",
+            params![dialect],
+        )
+        .map_err(|e| AppError::Storage(format!("Failed to delete pool container: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Update pool container status
+    pub fn update_pool_status(&self, dialect: &str, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pool_containers SET status = ?2 WHERE dialect = ?1",
+            params![dialect, status],
+        )
+        .map_err(|e| AppError::Storage(format!("Failed to update pool status: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// List all pool containers
+    pub fn list_pool_containers(&self) -> Result<Vec<PoolContainer>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT dialect, container_id, host_port, root_password, created_at, status
+                FROM pool_containers
+                "#,
+            )
+            .map_err(|e| AppError::Storage(format!("Failed to prepare query: {}", e)))?;
+
+        let pools = stmt
+            .query_map([], |row| {
+                let created_at_str: String = row.get(4)?;
+                Ok(PoolContainer {
+                    dialect: row.get(0)?,
+                    container_id: row.get(1)?,
+                    host_port: row.get(2)?,
+                    root_password: row.get(3)?,
+                    created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    status: row.get(5)?,
+                })
+            })
+            .map_err(|e| AppError::Storage(format!("Failed to query pool containers: {}", e)))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Storage(format!("Failed to collect pool containers: {}", e)))?;
+
+        Ok(pools)
     }
 }

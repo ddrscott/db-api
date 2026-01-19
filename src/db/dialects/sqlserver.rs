@@ -99,4 +99,73 @@ impl Dialect for SqlServerDialect {
             ],
         ))
     }
+
+    // Pool container methods
+
+    fn create_database_sql(&self, db_name: &str) -> String {
+        format!(
+            "IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{}') CREATE DATABASE [{}]",
+            db_name, db_name
+        )
+    }
+
+    fn drop_database_sql(&self, db_name: &str) -> String {
+        format!(
+            "IF EXISTS (SELECT name FROM sys.databases WHERE name = '{}') DROP DATABASE [{}]",
+            db_name, db_name
+        )
+    }
+
+    fn create_user_sql(&self, user: &str, password: &str, db_name: &str) -> String {
+        // SQL Server requires: create login, then use the database, create user, grant permissions
+        format!(
+            "IF NOT EXISTS (SELECT name FROM sys.server_principals WHERE name = '{}') \
+             CREATE LOGIN [{}] WITH PASSWORD = '{}'; \
+             USE [{}]; \
+             IF NOT EXISTS (SELECT name FROM sys.database_principals WHERE name = '{}') \
+             CREATE USER [{}] FOR LOGIN [{}]; \
+             ALTER ROLE db_owner ADD MEMBER [{}];",
+            user, user, password, db_name, user, user, user, user
+        )
+    }
+
+    fn drop_user_sql(&self, user: &str) -> String {
+        format!(
+            "IF EXISTS (SELECT name FROM sys.server_principals WHERE name = '{}') \
+             DROP LOGIN [{}]",
+            user, user
+        )
+    }
+
+    fn root_user(&self) -> &str {
+        "sa"
+    }
+
+    fn root_password_env(&self) -> &str {
+        "MSSQL_SA_PASSWORD"
+    }
+
+    fn pool_env_vars(&self, root_password: &str) -> Vec<(String, String)> {
+        vec![
+            ("ACCEPT_EULA".to_string(), "Y".to_string()),
+            ("MSSQL_SA_PASSWORD".to_string(), root_password.to_string()),
+        ]
+    }
+
+    fn exec_sql_command(&self, root_password: &str, sql: &str) -> (String, Vec<String>) {
+        (
+            "/opt/mssql-tools18/bin/sqlcmd".to_string(),
+            vec![
+                "-S".to_string(),
+                "localhost".to_string(),
+                "-U".to_string(),
+                "sa".to_string(),
+                "-P".to_string(),
+                root_password.to_string(),
+                "-Q".to_string(),
+                sql.to_string(),
+                "-C".to_string(), // Trust server certificate
+            ],
+        )
+    }
 }

@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::docker::DockerManager;
 use crate::error::{AppError, Result};
-use crate::storage::{BackupManager, InstanceState, MetadataStore, StoredInstance};
+use crate::storage::{BackupManager, InstanceState, MetadataStore, PoolContainer, StoredInstance};
 
 use super::dialects::{get_dialect, Dialect};
 use super::instance::{DbInstance, InstanceStatus};
@@ -43,6 +43,125 @@ impl InstanceManager {
 
     pub fn docker(&self) -> Arc<DockerManager> {
         self.docker.clone()
+    }
+
+    pub fn metadata(&self) -> Arc<MetadataStore> {
+        self.metadata.clone()
+    }
+
+    /// Get or create a pool container for the given dialect
+    async fn get_or_create_pool_container(&self, dialect: &dyn Dialect) -> Result<PoolContainer> {
+        let dialect_name = dialect.name();
+
+        // Check if we have a pool container in metadata
+        if let Some(pool) = self.metadata.get_pool_container(dialect_name)? {
+            // Verify container is still running
+            if self.docker.is_running(&pool.container_id).await.unwrap_or(false) {
+                debug!("Using existing pool container for {}: {}", dialect_name, pool.container_id);
+                return Ok(pool);
+            }
+            // Container died, remove stale record
+            info!("Pool container {} for {} is not running, creating new one", pool.container_id, dialect_name);
+            self.metadata.delete_pool_container(dialect_name)?;
+        }
+
+        // Create new pool container
+        info!("Creating new pool container for {}", dialect_name);
+        let root_password = generate_password();
+        let env_vars = dialect.pool_env_vars(&root_password);
+
+        let (container_id, host_port) = self
+            .docker
+            .create_pool_container(
+                dialect_name,
+                dialect.docker_image(),
+                env_vars,
+                dialect.default_port(),
+                self.config.container_memory_mb,
+            )
+            .await?;
+
+        // Wait for database to be ready (using a simple health check)
+        let timeout = Duration::from_secs(dialect.startup_timeout_secs());
+        info!("Waiting for pool container {} to be ready...", dialect_name);
+
+        let ready = self
+            .wait_for_pool_ready(&container_id, dialect, &root_password, timeout)
+            .await;
+
+        if !ready {
+            warn!("Pool container {} failed to become ready, cleaning up", dialect_name);
+            let _ = self.docker.destroy_container(&container_id).await;
+            return Err(AppError::Internal(
+                format!("Pool container for {} failed to start within timeout", dialect_name),
+            ));
+        }
+
+        let pool = PoolContainer {
+            dialect: dialect_name.to_string(),
+            container_id: container_id.clone(),
+            host_port,
+            root_password,
+            created_at: chrono::Utc::now(),
+            status: "running".to_string(),
+        };
+
+        self.metadata.upsert_pool_container(&pool)?;
+        info!("Pool container for {} ready on port {}", dialect_name, host_port);
+
+        Ok(pool)
+    }
+
+    /// Wait for pool container to be ready
+    async fn wait_for_pool_ready(
+        &self,
+        container_id: &str,
+        dialect: &dyn Dialect,
+        root_password: &str,
+        timeout: Duration,
+    ) -> bool {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let check_interval = Duration::from_millis(1000);
+
+        // For pool container, we check using root credentials
+        let (cmd, args) = dialect.exec_sql_command(root_password, "SELECT 1");
+
+        while start.elapsed() < timeout {
+            // Check if container is still running
+            match self.docker.is_running(container_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!("Pool container {} is not running", container_id);
+                    return false;
+                }
+                Err(e) => {
+                    debug!("Error checking container status: {}", e);
+                }
+            }
+
+            // Try the health check
+            match self.docker.exec(container_id, &cmd, &args, &[]).await {
+                Ok(output) => {
+                    if output.exit_code == Some(0) {
+                        debug!("Pool container health check passed");
+                        return true;
+                    }
+                    debug!(
+                        "Pool health check failed with exit code {:?}: {}",
+                        output.exit_code, output.stderr
+                    );
+                }
+                Err(e) => {
+                    debug!("Pool health check exec failed: {}", e);
+                }
+            }
+
+            tokio::time::sleep(check_interval).await;
+        }
+
+        false
     }
 
     /// Create a new database instance
@@ -106,104 +225,67 @@ impl InstanceManager {
         let db_user = format!("user_{}", &id.simple().to_string()[..8]);
         let db_password = generate_password();
 
-        let env_vars = dialect.env_vars(&db_name, &db_user, &db_password);
-
-        // Store metadata in container labels for recovery after restart
-        let mut labels = HashMap::new();
-        labels.insert("db-api.id".to_string(), id.to_string());
-        labels.insert("db-api.dialect".to_string(), dialect_name.to_string());
-        labels.insert("db-api.db_name".to_string(), db_name.clone());
-        labels.insert("db-api.db_user".to_string(), db_user.clone());
-        labels.insert("db-api.db_password".to_string(), db_password.clone());
-        labels.insert(
-            "db-api.container_port".to_string(),
-            dialect.default_port().to_string(),
-        );
-
         info!(
             "Creating {} instance {} with database {}",
             dialect_name, id, db_name
         );
 
-        let (container_id, host_port) = self
-            .docker
-            .create_container(
-                id,
-                dialect.docker_image(),
-                env_vars,
-                dialect.default_port(),
-                self.config.container_memory_mb,
-                labels,
-            )
-            .await?;
+        // Get or create pool container for this dialect
+        let pool = self.get_or_create_pool_container(dialect.as_ref()).await?;
+
+        // Create database inside the pool container
+        let create_db_sql = dialect.create_database_sql(&db_name);
+        let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &create_db_sql);
+
+        debug!("Creating database {} in pool container", db_name);
+        let output = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await?;
+
+        if output.exit_code != Some(0) {
+            warn!(
+                "Failed to create database {}: {}",
+                db_name, output.stderr
+            );
+            return Err(AppError::Internal(format!(
+                "Failed to create database: {}",
+                output.stderr
+            )));
+        }
+
+        // Create user with permissions
+        let create_user_sql = dialect.create_user_sql(&db_user, &db_password, &db_name);
+        let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &create_user_sql);
+
+        debug!("Creating user {} for database {}", db_user, db_name);
+        let output = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await?;
+
+        if output.exit_code != Some(0) {
+            // Cleanup: drop the database we just created
+            let drop_db_sql = dialect.drop_database_sql(&db_name);
+            let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_db_sql);
+            let _ = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await;
+
+            warn!(
+                "Failed to create user {}: {}",
+                db_user, output.stderr
+            );
+            return Err(AppError::Internal(format!(
+                "Failed to create database user: {}",
+                output.stderr
+            )));
+        }
 
         let mut instance = DbInstance::new(
             id,
             dialect_name.to_string(),
-            container_id.clone(),
-            host_port,
+            pool.container_id.clone(),
+            pool.host_port,
             db_name.clone(),
             db_user.clone(),
             db_password.clone(),
         );
+        instance.status = InstanceStatus::Running;
 
-        // Wait for the database to be ready
-        let timeout = Duration::from_secs(dialect.startup_timeout_secs());
-
-        info!("Waiting for database {} to be ready...", id);
-
-        let ready = self
-            .wait_for_db_ready(
-                &container_id,
-                dialect.as_ref(),
-                &db_name,
-                &db_user,
-                &db_password,
-                timeout,
-            )
-            .await;
-
-        if ready {
-            // Run post-startup command if the dialect has one (e.g., create database for SQL Server)
-            if let Some((cmd, args)) =
-                dialect.post_startup_command(&db_name, &db_user, &db_password)
-            {
-                let env = dialect.cli_env_vars(&db_name, &db_user, &db_password);
-                info!("Running post-startup setup for database {}", id);
-                match self.docker.exec(&container_id, &cmd, &args, &env).await {
-                    Ok(output) => {
-                        if output.exit_code != Some(0) {
-                            warn!(
-                                "Post-startup command failed with exit code {:?}: {}",
-                                output.exit_code, output.stderr
-                            );
-                            let _ = self.docker.destroy_container(&container_id).await;
-                            return Err(AppError::Internal(
-                                "Post-startup database setup failed".to_string(),
-                            ));
-                        }
-                        debug!("Post-startup setup completed");
-                    }
-                    Err(e) => {
-                        warn!("Post-startup command failed: {}", e);
-                        let _ = self.docker.destroy_container(&container_id).await;
-                        return Err(AppError::Internal(format!(
-                            "Post-startup database setup failed: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-
-            instance.status = InstanceStatus::Running;
-            info!("Database {} is ready", id);
-        } else {
-            warn!("Database {} failed to become ready, cleaning up", id);
-            let _ = self.docker.destroy_container(&container_id).await;
-            return Err(AppError::Internal(
-                "Database failed to start within timeout".to_string(),
-            ));
-        }
+        info!("Database {} created in pool container", id);
 
         // Store in metadata (persistent)
         let now = chrono::Utc::now();
@@ -214,8 +296,8 @@ impl InstanceManager {
             db_user: db_user.clone(),
             db_password: db_password.clone(),
             status: InstanceState::Active,
-            container_id: Some(container_id.clone()),
-            host_port: Some(host_port),
+            container_id: Some(pool.container_id.clone()),
+            host_port: Some(pool.host_port),
             created_at: now,
             last_activity: now,
             archived_at: None,
@@ -334,7 +416,7 @@ impl InstanceManager {
         Ok(())
     }
 
-    /// Archive an instance: dump database, upload to R2, destroy container
+    /// Archive an instance: dump database, upload to R2, drop database from pool
     pub async fn archive_instance(&self, id: Uuid) -> Result<()> {
         let backup = match &self.backup {
             Some(b) => b,
@@ -360,25 +442,26 @@ impl InstanceManager {
             return self.destroy_instance(id).await;
         }
 
-        let container_id = stored
-            .container_id
-            .as_ref()
-            .ok_or_else(|| AppError::Internal("No container ID for instance".to_string()))?;
+        // Get pool container for this dialect
+        let pool = self
+            .metadata
+            .get_pool_container(&stored.dialect)?
+            .ok_or_else(|| AppError::Internal("No pool container for dialect".to_string()))?;
 
         info!("Archiving instance {} (dialect: {})", id, stored.dialect);
 
-        // 1. Dump database
+        // 1. Dump database (using user credentials)
         let (cmd, args) = dialect.dump_command(&stored.db_name, &stored.db_user, &stored.db_password);
         let env = dialect.cli_env_vars(&stored.db_name, &stored.db_user, &stored.db_password);
 
-        let output = self.docker.exec(container_id, &cmd, &args, &env).await?;
+        let output = self.docker.exec(&pool.container_id, &cmd, &args, &env).await?;
 
         if output.exit_code != Some(0) {
             warn!(
                 "Database dump failed for {}: {}",
                 id, output.stderr
             );
-            // Still destroy the container even if dump fails
+            // Still drop the database even if dump fails
             let _ = self.destroy_instance(id).await;
             return Err(AppError::BackupFailed(format!(
                 "Dump failed: {}",
@@ -405,8 +488,14 @@ impl InstanceManager {
             instances.remove(&id);
         }
 
-        // 5. Destroy container
-        self.docker.destroy_container(container_id).await?;
+        // 5. Drop user and database from pool (not destroy container)
+        let drop_user_sql = dialect.drop_user_sql(&stored.db_user);
+        let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_user_sql);
+        let _ = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await;
+
+        let drop_db_sql = dialect.drop_database_sql(&stored.db_name);
+        let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_db_sql);
+        let _ = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await;
 
         info!("Instance {} archived successfully", id);
 
@@ -433,78 +522,55 @@ impl InstanceManager {
 
         let dialect = get_dialect(&stored.dialect)?;
 
-        // 2. Create new container
-        let env_vars = dialect.env_vars(&stored.db_name, &stored.db_user, &stored.db_password);
-
-        let mut labels = HashMap::new();
-        labels.insert("db-api.id".to_string(), stored.db_id.to_string());
-        labels.insert("db-api.dialect".to_string(), stored.dialect.clone());
-        labels.insert("db-api.db_name".to_string(), stored.db_name.clone());
-        labels.insert("db-api.db_user".to_string(), stored.db_user.clone());
-        labels.insert("db-api.db_password".to_string(), stored.db_password.clone());
-        labels.insert(
-            "db-api.container_port".to_string(),
-            dialect.default_port().to_string(),
-        );
-
-        let (container_id, host_port) = self
-            .docker
-            .create_container(
-                stored.db_id,
-                dialect.docker_image(),
-                env_vars,
-                dialect.default_port(),
-                self.config.container_memory_mb,
-                labels,
-            )
-            .await
+        // 2. Get or create pool container (fast if already exists)
+        let pool = self.get_or_create_pool_container(dialect.as_ref()).await
             .map_err(|e| {
-                // Revert status on failure
-                let _ = self
-                    .metadata
-                    .update_status(stored.db_id, InstanceState::Archived);
+                let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
                 e
             })?;
 
-        // 3. Wait for database ready
-        let timeout = Duration::from_secs(dialect.startup_timeout_secs());
-        let ready = self
-            .wait_for_db_ready(
-                &container_id,
-                dialect.as_ref(),
-                &stored.db_name,
-                &stored.db_user,
-                &stored.db_password,
-                timeout,
-            )
-            .await;
+        // 3. Create database in pool container
+        let create_db_sql = dialect.create_database_sql(&stored.db_name);
+        let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &create_db_sql);
 
-        if !ready {
-            let _ = self.docker.destroy_container(&container_id).await;
-            let _ = self
-                .metadata
-                .update_status(stored.db_id, InstanceState::Archived);
-            return Err(AppError::RestoreFailed(
-                "Database failed to start".to_string(),
-            ));
+        let output = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await
+            .map_err(|e| {
+                let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
+                AppError::RestoreFailed(format!("Failed to create database: {}", e))
+            })?;
+
+        if output.exit_code != Some(0) {
+            let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
+            return Err(AppError::RestoreFailed(format!(
+                "Failed to create database: {}",
+                output.stderr
+            )));
         }
 
-        // 4. Run post-startup if needed
-        if let Some((cmd, args)) =
-            dialect.post_startup_command(&stored.db_name, &stored.db_user, &stored.db_password)
-        {
-            let env = dialect.cli_env_vars(&stored.db_name, &stored.db_user, &stored.db_password);
-            let output = self.docker.exec(&container_id, &cmd, &args, &env).await?;
-            if output.exit_code != Some(0) {
-                let _ = self.docker.destroy_container(&container_id).await;
-                let _ = self
-                    .metadata
-                    .update_status(stored.db_id, InstanceState::Archived);
-                return Err(AppError::RestoreFailed(format!(
-                    "Post-startup failed: {}",
-                    output.stderr
-                )));
-            }
+        // 4. Create user with permissions
+        let create_user_sql = dialect.create_user_sql(&stored.db_user, &stored.db_password, &stored.db_name);
+        let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &create_user_sql);
+
+        let output = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await
+            .map_err(|e| {
+                // Cleanup: drop the database
+                let drop_db_sql = dialect.drop_database_sql(&stored.db_name);
+                let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_db_sql);
+                let _ = futures::executor::block_on(self.docker.exec(&pool.container_id, &cmd, &args, &[]));
+                let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
+                AppError::RestoreFailed(format!("Failed to create user: {}", e))
+            })?;
+
+        if output.exit_code != Some(0) {
+            // Cleanup: drop the database
+            let drop_db_sql = dialect.drop_database_sql(&stored.db_name);
+            let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_db_sql);
+            let _ = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await;
+            let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
+            return Err(AppError::RestoreFailed(format!(
+                "Failed to create user: {}",
+                output.stderr
+            )));
         }
 
         // 5. Download and restore backup
@@ -516,13 +582,17 @@ impl InstanceManager {
 
         let output = self
             .docker
-            .exec_with_stdin(&container_id, &cmd, &args, &env, &sql_data)
+            .exec_with_stdin(&pool.container_id, &cmd, &args, &env, &sql_data)
             .await
             .map_err(|e| {
-                let _ = self.docker.destroy_container(&container_id);
-                let _ = self
-                    .metadata
-                    .update_status(stored.db_id, InstanceState::Archived);
+                // Cleanup: drop user and database
+                let drop_user_sql = dialect.drop_user_sql(&stored.db_user);
+                let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_user_sql);
+                let _ = futures::executor::block_on(self.docker.exec(&pool.container_id, &cmd, &args, &[]));
+                let drop_db_sql = dialect.drop_database_sql(&stored.db_name);
+                let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_db_sql);
+                let _ = futures::executor::block_on(self.docker.exec(&pool.container_id, &cmd, &args, &[]));
+                let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
                 AppError::RestoreFailed(format!("Restore exec failed: {}", e))
             })?;
 
@@ -531,10 +601,14 @@ impl InstanceManager {
                 "Database restore failed for {}: {}",
                 stored.db_id, output.stderr
             );
-            let _ = self.docker.destroy_container(&container_id).await;
-            let _ = self
-                .metadata
-                .update_status(stored.db_id, InstanceState::Archived);
+            // Cleanup: drop user and database
+            let drop_user_sql = dialect.drop_user_sql(&stored.db_user);
+            let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_user_sql);
+            let _ = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await;
+            let drop_db_sql = dialect.drop_database_sql(&stored.db_name);
+            let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_db_sql);
+            let _ = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await;
+            let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
             return Err(AppError::RestoreFailed(format!(
                 "Restore failed: {}",
                 output.stderr
@@ -543,14 +617,14 @@ impl InstanceManager {
 
         // 6. Update metadata
         self.metadata
-            .mark_active(stored.db_id, &container_id, host_port)?;
+            .mark_active(stored.db_id, &pool.container_id, pool.host_port)?;
 
         // 7. Create instance and add to cache
         let mut instance = DbInstance::new(
             stored.db_id,
             stored.dialect.clone(),
-            container_id,
-            host_port,
+            pool.container_id.clone(),
+            pool.host_port,
             stored.db_name.clone(),
             stored.db_user.clone(),
             stored.db_password.clone(),
@@ -586,24 +660,40 @@ impl InstanceManager {
     }
 
     pub async fn destroy_instance(&self, id: Uuid) -> Result<()> {
+        // Get instance info from cache or metadata
+        let stored = self.metadata.get_instance(id)?.ok_or(AppError::DbNotFound)?;
+
         // Remove from cache
-        let instance = {
+        {
             let mut instances = self.instances.write().await;
-            instances.remove(&id)
-        };
+            instances.remove(&id);
+        }
 
-        // Get container ID from cache or metadata
-        let container_id = if let Some(inst) = instance {
-            inst.container_id
-        } else if let Some(stored) = self.metadata.get_instance(id)? {
-            stored.container_id.unwrap_or_default()
+        // Get pool container for this dialect
+        let dialect = get_dialect(&stored.dialect)?;
+        if let Some(pool) = self.metadata.get_pool_container(&stored.dialect)? {
+            // Drop user first
+            let drop_user_sql = dialect.drop_user_sql(&stored.db_user);
+            let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_user_sql);
+
+            debug!("Dropping user {} for instance {}", stored.db_user, id);
+            if let Err(e) = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await {
+                warn!("Failed to drop user {}: {}", stored.db_user, e);
+            }
+
+            // Drop database
+            let drop_db_sql = dialect.drop_database_sql(&stored.db_name);
+            let (cmd, args) = dialect.exec_sql_command(&pool.root_password, &drop_db_sql);
+
+            debug!("Dropping database {} for instance {}", stored.db_name, id);
+            if let Err(e) = self.docker.exec(&pool.container_id, &cmd, &args, &[]).await {
+                warn!("Failed to drop database {}: {}", stored.db_name, e);
+            }
+
+            info!("Instance {} destroyed (database dropped)", id);
         } else {
-            return Err(AppError::DbNotFound);
-        };
-
-        if !container_id.is_empty() {
-            info!("Destroying instance {}", id);
-            let _ = self.docker.destroy_container(&container_id).await;
+            // No pool container found - this might be a legacy instance or pool died
+            warn!("No pool container found for dialect {}, can't drop database", stored.dialect);
         }
 
         // Remove from metadata
@@ -656,100 +746,112 @@ impl InstanceManager {
     }
 
     /// Recover existing database containers on startup
-    /// Now reconciles Docker state with SQLite metadata
+    /// Now reconciles Docker state with SQLite metadata for pool containers
     pub async fn recover_existing_instances(&self) -> Result<usize> {
-        // First, load all active instances from metadata
-        let stored_instances = self.metadata.list_active_instances()?;
-        let mut recovered = 0;
-
-        for stored in stored_instances {
-            // Check if container still exists and is running
-            if let Some(container_id) = &stored.container_id {
-                match self.docker.is_running(container_id).await {
-                    Ok(true) => {
-                        // Container is running - add to cache
-                        let instance = DbInstance::new(
-                            stored.db_id,
-                            stored.dialect.clone(),
-                            container_id.clone(),
-                            stored.host_port.unwrap_or(0),
-                            stored.db_name.clone(),
-                            stored.db_user.clone(),
-                            stored.db_password.clone(),
-                        );
-
-                        info!(
-                            "Recovered instance {} ({}) on port {:?}",
-                            stored.db_id, stored.dialect, stored.host_port
-                        );
-
-                        let mut instances = self.instances.write().await;
-                        instances.insert(stored.db_id, instance);
-                        recovered += 1;
-                    }
-                    _ => {
-                        // Container not running - mark as needing attention
-                        warn!(
-                            "Instance {} container not running, marking as archived",
-                            stored.db_id
-                        );
-                        // If no backup, delete; otherwise mark archived
-                        if stored.backup_key.is_some() {
-                            let _ = self
-                                .metadata
-                                .update_status(stored.db_id, InstanceState::Archived);
-                        } else {
-                            let _ = self.metadata.delete_instance(stored.db_id);
-                        }
-                    }
+        // First, recover pool containers
+        let stored_pools = self.metadata.list_pool_containers()?;
+        for pool in stored_pools {
+            // Check if pool container still exists and is running
+            match self.docker.is_running(&pool.container_id).await {
+                Ok(true) => {
+                    info!(
+                        "Pool container for {} recovered on port {}",
+                        pool.dialect, pool.host_port
+                    );
+                }
+                _ => {
+                    // Pool container died - remove from metadata
+                    // Instances using it will need to be recreated
+                    warn!(
+                        "Pool container for {} not running, removing from metadata",
+                        pool.dialect
+                    );
+                    let _ = self.metadata.delete_pool_container(&pool.dialect);
                 }
             }
         }
 
-        // Also check for Docker containers not in metadata (legacy recovery)
-        let containers = self.docker.list_db_containers().await?;
-        for container in containers {
-            if self.metadata.get_instance(container.db_id)?.is_none() {
-                // Container exists but not in metadata - add it
-                if container.is_running && container.host_port > 0 {
-                    let now = chrono::Utc::now();
-                    let stored = StoredInstance {
-                        db_id: container.db_id,
-                        dialect: container.dialect.clone(),
-                        db_name: container.db_name.clone(),
-                        db_user: container.db_user.clone(),
-                        db_password: container.db_password.clone(),
-                        status: InstanceState::Active,
-                        container_id: Some(container.container_id.clone()),
-                        host_port: Some(container.host_port),
-                        created_at: now,
-                        last_activity: now,
-                        archived_at: None,
-                        backup_key: None,
-                        backup_size_bytes: None,
-                    };
+        // Also check for running pool containers not in metadata (e.g., API restarted but containers persisted)
+        let running_pools = self.docker.list_pool_containers().await?;
+        for pool in running_pools {
+            if self.metadata.get_pool_container(&pool.dialect)?.is_none() {
+                // Pool container exists but not in metadata - we can't use it
+                // because we don't know the root password. Destroy it.
+                warn!(
+                    "Found orphaned pool container for {}, destroying",
+                    pool.dialect
+                );
+                let _ = self.docker.destroy_container(&pool.container_id).await;
+            }
+        }
 
-                    if self.metadata.insert_instance(&stored).is_ok() {
-                        let instance = DbInstance::new(
-                            container.db_id,
-                            container.dialect,
-                            container.container_id,
-                            container.host_port,
-                            container.db_name,
-                            container.db_user,
-                            container.db_password,
-                        );
+        // Load all active instances from metadata
+        let stored_instances = self.metadata.list_active_instances()?;
+        let mut recovered = 0;
 
-                        info!(
-                            "Recovered legacy container {} on port {}",
-                            stored.db_id, container.host_port
-                        );
+        for stored in stored_instances {
+            // Check if the pool container for this dialect is running
+            if let Some(pool) = self.metadata.get_pool_container(&stored.dialect)? {
+                if self.docker.is_running(&pool.container_id).await.unwrap_or(false) {
+                    // Pool is running - add instance to cache
+                    let instance = DbInstance::new(
+                        stored.db_id,
+                        stored.dialect.clone(),
+                        pool.container_id.clone(),
+                        pool.host_port,
+                        stored.db_name.clone(),
+                        stored.db_user.clone(),
+                        stored.db_password.clone(),
+                    );
 
-                        let mut instances = self.instances.write().await;
-                        instances.insert(stored.db_id, instance);
-                        recovered += 1;
+                    info!(
+                        "Recovered instance {} ({}) on port {}",
+                        stored.db_id, stored.dialect, pool.host_port
+                    );
+
+                    let mut instances = self.instances.write().await;
+                    instances.insert(stored.db_id, instance);
+                    recovered += 1;
+                } else {
+                    // Pool not running - mark instance as orphaned
+                    warn!(
+                        "Instance {} pool container not running",
+                        stored.db_id
+                    );
+                    if stored.backup_key.is_some() {
+                        let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
+                    } else {
+                        let _ = self.metadata.delete_instance(stored.db_id);
                     }
                 }
+            } else {
+                // No pool container for this dialect
+                warn!(
+                    "No pool container for instance {} ({})",
+                    stored.db_id, stored.dialect
+                );
+                if stored.backup_key.is_some() {
+                    let _ = self.metadata.update_status(stored.db_id, InstanceState::Archived);
+                } else {
+                    let _ = self.metadata.delete_instance(stored.db_id);
+                }
+            }
+        }
+
+        // Also check for legacy Docker containers not in metadata
+        let containers = self.docker.list_db_containers().await?;
+        for container in containers {
+            // Legacy containers should be destroyed - we now use pool containers
+            if container.is_running {
+                warn!(
+                    "Found legacy container for instance {}, destroying",
+                    container.db_id
+                );
+                let _ = self.docker.destroy_container(&container.container_id).await;
+            }
+            // Clean up metadata if present
+            if self.metadata.get_instance(container.db_id)?.is_some() {
+                let _ = self.metadata.delete_instance(container.db_id);
             }
         }
 

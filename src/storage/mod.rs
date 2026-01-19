@@ -2,4 +2,4 @@ mod backup;
 mod metadata;
 
 pub use backup::BackupManager;
-pub use metadata::{InstanceState, MetadataStore, StoredInstance};
+pub use metadata::{InstanceState, MetadataStore, PoolContainer, StoredInstance};

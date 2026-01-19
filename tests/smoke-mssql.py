@@ -5,7 +5,9 @@ import sys
 import time
 import httpx
 
-BASE_URL = "https://db-api.ljs.app"
+# Use environment variable or default to local
+import os
+BASE_URL = os.environ.get("DB_API_URL", "http://localhost:8013")
 
 
 def timed(func):
