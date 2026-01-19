@@ -1,0 +1,13 @@
+/target
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# macOS
+.DS_Store

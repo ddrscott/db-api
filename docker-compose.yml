@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8080
+      - INACTIVITY_TIMEOUT_SECS=1800
+      - QUERY_TIMEOUT_SECS=60
+      - CONTAINER_MEMORY_MB=512
+      - MAX_DB_SIZE_MB=10
+      - MAX_CONNECTIONS=10
+      - RUST_LOG=info
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped

@@ -1,0 +1,440 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "db-api",
+    "description": "RESTful API with SSE support for SQL query execution across any database dialect.",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "Current server"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Health check",
+        "description": "Returns the health status of the API and Docker connectivity.",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/db/new": {
+      "post": {
+        "tags": ["Database"],
+        "summary": "Create database instance",
+        "description": "Creates a new ephemeral database instance of the specified dialect.",
+        "operationId": "createDatabase",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDbRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Database created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateDbResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unsupported dialect",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Failed to pull Docker image",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/db/{db_id}": {
+      "get": {
+        "tags": ["Database"],
+        "summary": "Get database status",
+        "description": "Returns the current status and metadata of a database instance.",
+        "operationId": "getDatabaseStatus",
+        "parameters": [
+          {
+            "name": "db_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Database instance UUID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Database status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DbStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Database not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Database"],
+        "summary": "Destroy database instance",
+        "description": "Destroys a database instance and removes its container.",
+        "operationId": "destroyDatabase",
+        "parameters": [
+          {
+            "name": "db_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Database instance UUID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Database destroyed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DestroyDbResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Database not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/db/{db_id}/query": {
+      "post": {
+        "tags": ["Query"],
+        "summary": "Execute SQL query",
+        "description": "Executes SQL query(ies) with configurable output format. Default returns JSON array. Use format=text for raw CLI output, format=jsonl or transport=sse for streaming.",
+        "operationId": "executeQuery",
+        "parameters": [
+          {
+            "name": "db_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Database instance UUID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Query results in requested format",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryJsonResponse"
+                },
+                "example": {
+                  "columns": ["id", "name"],
+                  "rows": [[1, "Alice"], [2, "Bob"]],
+                  "affected_rows": null,
+                  "messages": []
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "description": "Raw CLI output (format=text)"
+                },
+                "example": "id\tname\n1\tAlice\n2\tBob\n"
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "SSE stream with event types: line, record, error, done (format=jsonl)"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Database not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Query timeout",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateDbRequest": {
+        "type": "object",
+        "required": ["dialect"],
+        "properties": {
+          "dialect": {
+            "type": "string",
+            "enum": ["mysql", "mariadb", "sqlserver", "mssql"],
+            "description": "Database dialect to create",
+            "example": "mysql"
+          }
+        }
+      },
+      "CreateDbResponse": {
+        "type": "object",
+        "properties": {
+          "db_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Unique identifier for the database instance"
+          },
+          "dialect": {
+            "type": "string",
+            "description": "Database dialect"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["starting", "running", "stopped", "destroyed"]
+          }
+        }
+      },
+      "DbStatusResponse": {
+        "type": "object",
+        "properties": {
+          "db_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "dialect": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["starting", "running", "stopped", "destroyed"]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_activity": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the instance will be automatically destroyed due to inactivity"
+          }
+        }
+      },
+      "DestroyDbResponse": {
+        "type": "object",
+        "properties": {
+          "db_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["destroyed"]
+          }
+        }
+      },
+      "QueryRequest": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "SQL query to execute. Multiple statements can be separated by semicolons.",
+            "example": "SELECT * FROM users WHERE id = 1"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["text", "json", "jsonl"],
+            "default": "json",
+            "description": "Output format. 'text' returns raw CLI output, 'json' returns structured JSON array (default), 'jsonl' returns JSON Lines via SSE."
+          },
+          "transport": {
+            "type": "string",
+            "enum": ["sse"],
+            "description": "Transport mechanism. 'sse' enables Server-Sent Events streaming (implies format=jsonl)."
+          }
+        }
+      },
+      "QueryJsonResponse": {
+        "type": "object",
+        "description": "JSON response format for query results (format=json)",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Column names from the result set"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {}
+            },
+            "description": "Array of rows, each row is an array of values"
+          },
+          "affected_rows": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Number of rows affected by INSERT/UPDATE/DELETE"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true,
+            "description": "SQL error message if query failed"
+          },
+          "messages": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Informational messages from the database"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["healthy", "unhealthy"]
+          },
+          "docker": {
+            "type": "string",
+            "enum": ["connected", "disconnected"]
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "DB_NOT_FOUND",
+                  "DIALECT_UNSUPPORTED",
+                  "DIALECT_PULL_FAILED",
+                  "QUERY_TIMEOUT",
+                  "QUERY_SYNTAX_ERROR",
+                  "DB_SIZE_EXCEEDED",
+                  "BACKUP_NOT_FOUND",
+                  "BACKUP_EXPIRED",
+                  "DOCKER_ERROR",
+                  "INTERNAL_ERROR"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "detail": {
+                "type": "string",
+                "nullable": true
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Database",
+      "description": "Database instance lifecycle management"
+    },
+    {
+      "name": "Query",
+      "description": "SQL query execution"
+    },
+    {
+      "name": "Operations",
+      "description": "Health and monitoring endpoints"
+    }
+  ]
+}
