@@ -29,15 +29,16 @@ impl Dialect for SqlServerDialect {
         ]
     }
 
-    fn cli_command(&self, db_name: &str, _user: &str, _password: &str, query: &str) -> (String, Vec<String>) {
+    fn cli_command(&self, db_name: &str, user: &str, _password: &str, query: &str) -> (String, Vec<String>) {
         // Password is passed via SQLCMDPASSWORD env var
+        // Use the actual instance user, not 'sa' (which we don't have the password for in pool mode)
         (
             "/opt/mssql-tools18/bin/sqlcmd".to_string(),
             vec![
                 "-S".to_string(),
                 "localhost".to_string(),
                 "-U".to_string(),
-                "sa".to_string(),
+                user.to_string(),
                 "-d".to_string(),
                 db_name.to_string(),
                 "-Q".to_string(),
