@@ -46,6 +46,12 @@ pub trait Dialect: Send + Sync {
     fn cli_command_text(&self, db_name: &str, user: &str, password: &str, query: &str) -> (String, Vec<String>) {
         self.cli_command(db_name, user, password, query)
     }
+
+    /// Optional post-startup command to run after health check passes
+    /// Used by SQL Server to create the database (since it doesn't auto-create like MySQL)
+    fn post_startup_command(&self, _db_name: &str, _user: &str, _password: &str) -> Option<(String, Vec<String>)> {
+        None
+    }
 }
 
 /// Get a dialect implementation by name

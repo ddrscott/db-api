@@ -99,6 +99,34 @@ impl InstanceManager {
             .await;
 
         if ready {
+            // Run post-startup command if the dialect has one (e.g., create database for SQL Server)
+            if let Some((cmd, args)) = dialect.post_startup_command(&db_name, &db_user, &db_password) {
+                let env = dialect.cli_env_vars(&db_name, &db_user, &db_password);
+                info!("Running post-startup setup for database {}", id);
+                match self.docker.exec(&container_id, &cmd, &args, &env).await {
+                    Ok(output) => {
+                        if output.exit_code != Some(0) {
+                            warn!(
+                                "Post-startup command failed with exit code {:?}: {}",
+                                output.exit_code, output.stderr
+                            );
+                            let _ = self.docker.destroy_container(&container_id).await;
+                            return Err(AppError::Internal(
+                                "Post-startup database setup failed".to_string(),
+                            ));
+                        }
+                        debug!("Post-startup setup completed");
+                    }
+                    Err(e) => {
+                        warn!("Post-startup command failed: {}", e);
+                        let _ = self.docker.destroy_container(&container_id).await;
+                        return Err(AppError::Internal(
+                            format!("Post-startup database setup failed: {}", e),
+                        ));
+                    }
+                }
+            }
+
             instance.status = InstanceStatus::Running;
             info!("Database {} is ready", id);
         } else {

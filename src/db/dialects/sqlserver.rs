@@ -78,4 +78,25 @@ impl Dialect for SqlServerDialect {
             ],
         )
     }
+
+    fn post_startup_command(&self, db_name: &str, _user: &str, _password: &str) -> Option<(String, Vec<String>)> {
+        // Create the database after SQL Server is ready
+        // SQL Server doesn't auto-create databases via env vars like MySQL
+        let create_db_sql = format!(
+            "IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{}') CREATE DATABASE [{}]",
+            db_name, db_name
+        );
+        Some((
+            "/opt/mssql-tools18/bin/sqlcmd".to_string(),
+            vec![
+                "-S".to_string(),
+                "localhost".to_string(),
+                "-U".to_string(),
+                "sa".to_string(),
+                "-Q".to_string(),
+                create_db_sql,
+                "-C".to_string(),
+            ],
+        ))
+    }
 }
