@@ -68,3 +68,20 @@ test-mysql: ## Create a MySQL instance
 	curl -s -X POST http://localhost:$(PORT)/db/new \
 		-H "Content-Type: application/json" \
 		-d '{"dialect": "mysql"}' | jq .
+
+# Deployment
+DEPLOY_HOST ?= spierce@192.168.86.10
+DEPLOY_PATH ?= code/db-api
+
+deploy: ## Deploy to production server (pull, build, restart)
+	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && \
+		git pull && \
+		docker compose build && \
+		docker compose down && \
+		docker compose up -d'
+
+deploy-logs: ## Show logs from production server
+	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && docker compose logs --tail=50'
+
+deploy-status: ## Check production server status
+	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && docker compose ps'

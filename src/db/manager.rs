@@ -218,6 +218,8 @@ impl InstanceManager {
         specified_id: Option<Uuid>,
     ) -> Result<DbInstance> {
         let dialect = get_dialect(dialect_name)?;
+        // Use canonical dialect name for consistency (e.g., "mssql" -> "sqlserver")
+        let canonical_name = dialect.name();
         let id = specified_id.unwrap_or_else(Uuid::new_v4);
 
         // Generate unique credentials for this instance
@@ -227,7 +229,7 @@ impl InstanceManager {
 
         info!(
             "Creating {} instance {} with database {}",
-            dialect_name, id, db_name
+            canonical_name, id, db_name
         );
 
         // Get or create pool container for this dialect
@@ -276,7 +278,7 @@ impl InstanceManager {
 
         let mut instance = DbInstance::new(
             id,
-            dialect_name.to_string(),
+            canonical_name.to_string(),
             pool.container_id.clone(),
             pool.host_port,
             db_name.clone(),
@@ -291,7 +293,7 @@ impl InstanceManager {
         let now = chrono::Utc::now();
         let stored = StoredInstance {
             db_id: id,
-            dialect: dialect_name.to_string(),
+            dialect: canonical_name.to_string(),
             db_name: db_name.clone(),
             db_user: db_user.clone(),
             db_password: db_password.clone(),
