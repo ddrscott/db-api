@@ -9,6 +9,8 @@ pub enum InstanceStatus {
     Running,
     Stopped,
     Destroyed,
+    Archived,
+    Restoring,
 }
 
 #[derive(Debug, Clone)]

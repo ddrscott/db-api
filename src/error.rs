@@ -32,6 +32,21 @@ pub enum AppError {
     #[error("Backup has expired")]
     BackupExpired,
 
+    #[error("Backup failed: {0}")]
+    BackupFailed(String),
+
+    #[error("Restore failed: {0}")]
+    RestoreFailed(String),
+
+    #[error("Database is currently being restored")]
+    RestoreInProgress,
+
+    #[error("Storage error: {0}")]
+    Storage(String),
+
+    #[error("R2 error: {0}")]
+    R2(String),
+
     #[error("Docker error: {0}")]
     Docker(#[from] bollard::errors::Error),
 
@@ -50,6 +65,11 @@ impl AppError {
             Self::DbSizeExceeded => "DB_SIZE_EXCEEDED",
             Self::BackupNotFound => "BACKUP_NOT_FOUND",
             Self::BackupExpired => "BACKUP_EXPIRED",
+            Self::BackupFailed(_) => "BACKUP_FAILED",
+            Self::RestoreFailed(_) => "RESTORE_FAILED",
+            Self::RestoreInProgress => "RESTORE_IN_PROGRESS",
+            Self::Storage(_) => "STORAGE_ERROR",
+            Self::R2(_) => "R2_ERROR",
             Self::Docker(_) => "DOCKER_ERROR",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
@@ -65,6 +85,11 @@ impl AppError {
             Self::DbSizeExceeded => StatusCode::PAYLOAD_TOO_LARGE,
             Self::BackupNotFound => StatusCode::NOT_FOUND,
             Self::BackupExpired => StatusCode::GONE,
+            Self::BackupFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::RestoreFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::RestoreInProgress => StatusCode::CONFLICT,
+            Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::R2(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Docker(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -89,6 +114,10 @@ impl IntoResponse for AppError {
         let detail = match &self {
             Self::QuerySyntaxError(msg) => Some(msg.clone()),
             Self::DialectPullFailed(msg) => Some(msg.clone()),
+            Self::BackupFailed(msg) => Some(msg.clone()),
+            Self::RestoreFailed(msg) => Some(msg.clone()),
+            Self::Storage(msg) => Some(msg.clone()),
+            Self::R2(msg) => Some(msg.clone()),
             Self::Docker(e) => Some(e.to_string()),
             Self::Internal(msg) => Some(msg.clone()),
             _ => None,

@@ -19,6 +19,9 @@ use super::response::{create_json_response, create_sse_response, create_text_res
 #[derive(Debug, Deserialize)]
 pub struct CreateDbRequest {
     pub dialect: String,
+    /// Optional db_id to restore an existing archived database
+    #[serde(default)]
+    pub db_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -26,6 +29,9 @@ pub struct CreateDbResponse {
     pub db_id: Uuid,
     pub dialect: String,
     pub status: InstanceStatus,
+    /// True if database was restored from backup
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,6 +42,12 @@ pub struct DbStatusResponse {
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// True if a backup exists for this database
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub backup_available: bool,
+    /// When the database was archived (if archived)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,12 +103,16 @@ pub async fn create_db(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateDbRequest>,
 ) -> Result<Json<CreateDbResponse>> {
-    let instance = state.manager.create_instance(&req.dialect).await?;
+    let (instance, restored) = state
+        .manager
+        .get_or_create_instance(&req.dialect, req.db_id)
+        .await?;
 
     Ok(Json(CreateDbResponse {
         db_id: instance.id,
         dialect: instance.dialect,
         status: instance.status,
+        restored,
     }))
 }
 
@@ -104,19 +120,49 @@ pub async fn get_db_status(
     State(state): State<Arc<AppState>>,
     Path(db_id): Path<Uuid>,
 ) -> Result<Json<DbStatusResponse>> {
-    let instance = state.manager.get_instance(db_id).await?;
+    // Try to get active instance first
+    match state.manager.get_instance(db_id).await {
+        Ok(instance) => {
+            // Check metadata for backup info
+            let stored = state.manager.get_stored_instance(db_id)?;
+            let backup_available = stored.as_ref().map(|s| s.backup_key.is_some()).unwrap_or(false);
 
-    let expires_at = instance.last_activity
-        + chrono::Duration::seconds(state.inactivity_timeout_secs);
+            let expires_at = instance.last_activity
+                + chrono::Duration::seconds(state.inactivity_timeout_secs);
 
-    Ok(Json(DbStatusResponse {
-        db_id: instance.id,
-        dialect: instance.dialect,
-        status: instance.status,
-        created_at: instance.created_at,
-        last_activity: instance.last_activity,
-        expires_at,
-    }))
+            Ok(Json(DbStatusResponse {
+                db_id: instance.id,
+                dialect: instance.dialect,
+                status: instance.status,
+                created_at: instance.created_at,
+                last_activity: instance.last_activity,
+                expires_at,
+                backup_available,
+                archived_at: None,
+            }))
+        }
+        Err(crate::error::AppError::DbNotFound) => {
+            // Check if archived
+            if let Some(stored) = state.manager.get_stored_instance(db_id)? {
+                let expires_at = stored.last_activity
+                    + chrono::Duration::seconds(state.inactivity_timeout_secs);
+
+                Ok(Json(DbStatusResponse {
+                    db_id: stored.db_id,
+                    dialect: stored.dialect,
+                    status: InstanceStatus::Archived,
+                    created_at: stored.created_at,
+                    last_activity: stored.last_activity,
+                    expires_at,
+                    backup_available: stored.backup_key.is_some(),
+                    archived_at: stored.archived_at,
+                }))
+            } else {
+                Err(crate::error::AppError::DbNotFound)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn destroy_db(

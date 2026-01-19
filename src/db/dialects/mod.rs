@@ -52,6 +52,23 @@ pub trait Dialect: Send + Sync {
     fn post_startup_command(&self, _db_name: &str, _user: &str, _password: &str) -> Option<(String, Vec<String>)> {
         None
     }
+
+    /// Whether this dialect supports backup/restore
+    fn supports_backup(&self) -> bool {
+        false
+    }
+
+    /// Build the CLI command to dump the database
+    /// Returns (executable, args) that will produce SQL dump on stdout
+    fn dump_command(&self, _db_name: &str, _user: &str, _password: &str) -> (String, Vec<String>) {
+        ("echo".to_string(), vec!["-- backup not supported".to_string()])
+    }
+
+    /// Build the CLI command to restore the database from SQL dump
+    /// Returns (executable, args) that will accept SQL on stdin
+    fn restore_command(&self, _db_name: &str, _user: &str, _password: &str) -> (String, Vec<String>) {
+        ("cat".to_string(), vec![])
+    }
 }
 
 /// Get a dialect implementation by name

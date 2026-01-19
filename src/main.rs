@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod docker;
 mod error;
+mod storage;
 
 use std::sync::Arc;
 use tracing::info;
@@ -12,6 +13,7 @@ use crate::api::create_router;
 use crate::config::Config;
 use crate::db::InstanceManager;
 use crate::docker::DockerManager;
+use crate::storage::{BackupManager, MetadataStore};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,9 +41,33 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to connect to Docker daemon");
     info!("Connected to Docker daemon");
 
+    // Initialize metadata store (SQLite)
+    let metadata = MetadataStore::new(&config.metadata_db_path)
+        .expect("Failed to initialize metadata store");
+    info!("Metadata store initialized at {}", config.metadata_db_path);
+
+    // Initialize backup manager (R2) if configured
+    let backup = if config.backup_enabled() {
+        match BackupManager::new(&config).await {
+            Ok(b) => {
+                info!("Backup manager initialized for bucket {}", config.r2_bucket);
+                Some(b)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize backup manager: {}. Backups disabled.", e);
+                None
+            }
+        }
+    } else {
+        info!("Backup not configured or disabled");
+        None
+    };
+
     // Initialize instance manager
     let manager = InstanceManager::new(
         DockerManager::new().expect("Failed to create Docker manager"),
+        metadata,
+        backup,
         config.clone(),
     );
     let manager = Arc::new(manager);

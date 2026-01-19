@@ -244,6 +244,107 @@ impl DockerManager {
         }
     }
 
+    /// Execute a command with stdin data piped in
+    /// Used for database restore operations where SQL is piped to the client
+    pub async fn exec_with_stdin(
+        &self,
+        container_id: &str,
+        cmd: &str,
+        args: &[String],
+        env: &[(String, String)],
+        stdin_data: &[u8],
+    ) -> Result<ExecOutput> {
+        use bollard::exec::StartExecOptions;
+        use tokio::io::AsyncWriteExt;
+
+        let mut full_cmd = vec![cmd.to_string()];
+        full_cmd.extend(args.iter().cloned());
+
+        debug!(
+            "Executing with stdin in container {}: {:?} ({} bytes)",
+            container_id,
+            full_cmd,
+            stdin_data.len()
+        );
+
+        let env_vars: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+
+        let exec_options = CreateExecOptions {
+            cmd: Some(full_cmd),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            env: if env_vars.is_empty() {
+                None
+            } else {
+                Some(env_vars)
+            },
+            ..Default::default()
+        };
+
+        let exec = self.docker.create_exec(container_id, exec_options).await?;
+
+        let start_options = StartExecOptions {
+            detach: false,
+            ..Default::default()
+        };
+
+        let start_result = self
+            .docker
+            .start_exec(&exec.id, Some(start_options))
+            .await?;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+
+        if let StartExecResults::Attached {
+            mut output,
+            mut input,
+        } = start_result
+        {
+            // Write stdin data
+            input.write_all(stdin_data).await.map_err(|e| {
+                AppError::RestoreFailed(format!("Failed to write stdin: {}", e))
+            })?;
+            input.shutdown().await.map_err(|e| {
+                AppError::RestoreFailed(format!("Failed to close stdin: {}", e))
+            })?;
+
+            // Read output
+            while let Some(msg) = output.next().await {
+                match msg {
+                    Ok(bollard::container::LogOutput::StdOut { message }) => {
+                        stdout.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(bollard::container::LogOutput::StdErr { message }) => {
+                        stderr.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Error reading exec output: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Get exit code
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        let exit_code = inspect.exit_code;
+
+        debug!(
+            "Exec with stdin completed with exit code {:?}, stdout len: {}, stderr len: {}",
+            exit_code,
+            stdout.len(),
+            stderr.len()
+        );
+
+        Ok(ExecOutput {
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+
     pub async fn stop_container(&self, container_id: &str) -> Result<()> {
         info!("Stopping container: {}", container_id);
 

@@ -78,4 +78,33 @@ impl Dialect for MySqlDialect {
             ],
         )
     }
+
+    fn supports_backup(&self) -> bool {
+        true
+    }
+
+    fn dump_command(&self, db_name: &str, user: &str, _password: &str) -> (String, Vec<String>) {
+        // Password is passed via MYSQL_PWD env var
+        // Use --single-transaction for consistent dump without locking
+        (
+            "mysqldump".to_string(),
+            vec![
+                "-u".to_string(),
+                user.to_string(),
+                "--single-transaction".to_string(),
+                "--routines".to_string(),
+                "--triggers".to_string(),
+                db_name.to_string(),
+            ],
+        )
+    }
+
+    fn restore_command(&self, db_name: &str, user: &str, _password: &str) -> (String, Vec<String>) {
+        // Password is passed via MYSQL_PWD env var
+        // Reads SQL from stdin
+        (
+            "mysql".to_string(),
+            vec!["-u".to_string(), user.to_string(), db_name.to_string()],
+        )
+    }
 }

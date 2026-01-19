@@ -17,3 +17,9 @@ tokio-stream = "0.1"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
+
+# Storage (Phase 1-2)
+rusqlite = { version = "0.32", features = ["bundled"] }
+aws-config = "1.5"
+aws-sdk-s3 = "1.65"
+flate2 = "1.0"

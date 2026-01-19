@@ -12,6 +12,19 @@ services:
       - MAX_DB_SIZE_MB=10
       - MAX_CONNECTIONS=10
       - RUST_LOG=info
+      # SQLite metadata path
+      - METADATA_DB_PATH=/data/metadata.db
+      # R2/S3 backup configuration (set these in .env file)
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID:-}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_BUCKET=${R2_BUCKET:-db-api-backups}
+      # Feature flags
+      - BACKUP_ON_EXPIRY=${BACKUP_ON_EXPIRY:-true}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - db-api-data:/data
     restart: unless-stopped
+
+volumes:
+  db-api-data:
