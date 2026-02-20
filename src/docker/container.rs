@@ -417,6 +417,7 @@ impl DockerManager {
         env_vars: Vec<(String, String)>,
         container_port: u16,
         memory_limit_mb: u32,
+        shm_size_mb: u32,
     ) -> Result<(String, u16)> {
         let container_name = format!("db-api-pool-{}", dialect_name);
 
@@ -440,9 +441,17 @@ impl DockerManager {
             }]),
         );
 
+        // Set shm_size if specified (needed by Oracle)
+        let shm_size = if shm_size_mb > 0 {
+            Some((shm_size_mb as i64) * 1024 * 1024)
+        } else {
+            None
+        };
+
         let host_config = HostConfig {
             port_bindings: Some(port_bindings),
             memory: Some((memory_limit_mb as i64) * 1024 * 1024),
+            shm_size,
             ..Default::default()
         };
 

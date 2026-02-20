@@ -1,9 +1,11 @@
 mod mysql;
+mod oracle;
 mod sqlserver;
 
 use crate::error::{AppError, Result};
 
 pub use mysql::MySqlDialect;
+pub use oracle::OracleDialect;
 pub use sqlserver::SqlServerDialect;
 
 /// Trait defining database dialect behavior
@@ -31,6 +33,16 @@ pub trait Dialect: Send + Sync {
     /// Time to wait for database to be ready (some are slower)
     fn startup_timeout_secs(&self) -> u64 {
         60
+    }
+
+    /// Minimum memory required in MB (Oracle needs 4GB+)
+    fn min_memory_mb(&self) -> u32 {
+        512
+    }
+
+    /// Shared memory size in MB (Oracle needs 1GB+)
+    fn shm_size_mb(&self) -> u32 {
+        0
     }
 
     /// Command to check if database is ready
@@ -102,11 +114,12 @@ pub fn get_dialect(name: &str) -> Result<Box<dyn Dialect>> {
     match name.to_lowercase().as_str() {
         "mysql" | "mariadb" => Ok(Box::new(MySqlDialect)),
         "sqlserver" | "mssql" => Ok(Box::new(SqlServerDialect)),
+        "oracle" => Ok(Box::new(OracleDialect)),
         _ => Err(AppError::DialectUnsupported(name.to_string())),
     }
 }
 
 /// List of supported dialect names
 pub fn supported_dialects() -> Vec<&'static str> {
-    vec!["mysql", "sqlserver"]
+    vec!["mysql", "sqlserver", "oracle"]
 }

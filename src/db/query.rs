@@ -178,7 +178,12 @@ fn parse_cli_output(
         // Try to parse as tab-separated data
         if line.contains('\t') {
             // This could be a header row or a data row
-            let columns: Vec<String> = line.split('\t').map(|s| s.to_string()).collect();
+            // Filter out empty/whitespace-only values (Oracle uses tabs for padding)
+            let columns: Vec<String> = line
+                .split('\t')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
 
             // Peek at next line to see if this is a header
             if let Some(next_line) = line_iter.peek() {
@@ -186,6 +191,7 @@ fn parse_cli_output(
                 if next_line.contains('\t') || next_line.is_empty() {
                     // This is likely a header, emit subsequent rows as records
                     let header = columns.clone();
+                    let num_columns = header.len();
 
                     // Skip separator lines (e.g., "---\t---\t---")
                     while let Some(data_line) = line_iter.next() {
@@ -197,9 +203,14 @@ fn parse_cli_output(
                             continue;
                         }
 
+                        // Parse values, filtering empty ones (Oracle padding)
+                        // Only take as many values as we have columns
                         let values: Vec<JsonValue> = data_line
                             .split('\t')
-                            .map(|s| parse_value(s.trim()))
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .take(num_columns)
+                            .map(parse_value)
                             .collect();
 
                         events.push(QueryEvent::Record {

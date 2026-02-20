@@ -70,6 +70,10 @@ impl InstanceManager {
         let root_password = generate_password();
         let env_vars = dialect.pool_env_vars(&root_password);
 
+        // Use at least the dialect's minimum memory requirement
+        let memory_mb = self.config.container_memory_mb.max(dialect.min_memory_mb());
+        let shm_size_mb = dialect.shm_size_mb();
+
         let (container_id, host_port) = self
             .docker
             .create_pool_container(
@@ -77,7 +81,8 @@ impl InstanceManager {
                 dialect.docker_image(),
                 env_vars,
                 dialect.default_port(),
-                self.config.container_memory_mb,
+                memory_mb,
+                shm_size_mb,
             )
             .await?;
 
@@ -865,6 +870,7 @@ impl InstanceManager {
 fn generate_password() -> String {
     // SQL Server requires strong passwords: uppercase, lowercase, numbers, and special chars
     // Use a UUID-based approach that satisfies these requirements
+    // Avoid shell special chars like !@#$` which break docker exec commands
     let uuid = Uuid::new_v4().to_string();
-    format!("Pwd{}!@#", uuid.replace("-", ""))
+    format!("Pwd{}_Xs", uuid.replace("-", ""))
 }

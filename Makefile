@@ -10,16 +10,23 @@ DOCKER_SOCKET := $(shell \
 		echo ""; \
 	fi)
 
+# Use rustup cargo (Homebrew cargo doesn't respect toolchain files)
+RUSTUP_CARGO := $(HOME)/.rustup/toolchains/1.88-aarch64-apple-darwin/bin/cargo
+CARGO := $(shell [ -x "$(RUSTUP_CARGO)" ] && echo "$(RUSTUP_CARGO)" || echo "cargo")
+
 # Configuration
 PORT ?= 8081
 RUST_LOG ?= info
+METADATA_DB_PATH ?= ./data/metadata.db
 
 # Export for subprocesses
 export DOCKER_HOST := $(DOCKER_SOCKET)
 export PORT
 export RUST_LOG
+export METADATA_DB_PATH
+export RUSTC := $(HOME)/.rustup/toolchains/1.88-aarch64-apple-darwin/bin/rustc
 
-.PHONY: run build release check clean test docker-build docker-run help
+.PHONY: run build release check clean test docker-build docker-run help test-health test-mysql test-oracle smoke-oracle
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -27,28 +34,28 @@ help: ## Show this help
 run: ## Run the server (debug mode)
 	@echo "Using Docker socket: $(DOCKER_SOCKET)"
 	@echo "Server will listen on port $(PORT)"
-	cargo run
+	$(CARGO) run
 
 build: ## Build debug binary
-	cargo build
+	$(CARGO) build
 
 release: ## Build release binary
-	cargo build --release
+	$(CARGO) build --release
 
 check: ## Check code without building
-	cargo check
+	$(CARGO) check
 
 clean: ## Clean build artifacts
-	cargo clean
+	$(CARGO) clean
 
 test: ## Run tests
-	cargo test
+	$(CARGO) test
 
 fmt: ## Format code
-	cargo fmt
+	$(CARGO) fmt
 
 lint: ## Run clippy linter
-	cargo clippy -- -W warnings
+	$(CARGO) clippy -- -W warnings
 
 docker-build: ## Build Docker image
 	docker build -t db-api .
@@ -68,6 +75,14 @@ test-mysql: ## Create a MySQL instance
 	curl -s -X POST http://localhost:$(PORT)/db/new \
 		-H "Content-Type: application/json" \
 		-d '{"dialect": "mysql"}' | jq .
+
+test-oracle: ## Create an Oracle instance
+	curl -s -X POST http://localhost:$(PORT)/db/new \
+		-H "Content-Type: application/json" \
+		-d '{"dialect": "oracle"}' | jq .
+
+smoke-oracle: ## Run full Oracle smoke test (requires running server)
+	DB_API_URL=http://localhost:$(PORT) uv run ./tests/smoke-oracle.py
 
 # Deployment
 DEPLOY_HOST ?= spierce@192.168.86.10
