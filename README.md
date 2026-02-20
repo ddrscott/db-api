@@ -31,7 +31,7 @@ curl -X POST http://localhost:8081/db/{db_id}/query \
 
 ## Features
 
-- **Multiple Dialects**: MySQL 8, SQL Server (more coming)
+- **Multiple Dialects**: MySQL 8, SQL Server, Oracle Free
 - **Ephemeral Instances**: Auto-cleanup after 30 minutes of inactivity
 - **Streaming Responses**: Server-Sent Events for real-time query output
 - **Container Pooling**: 80x faster database creation
@@ -131,7 +131,7 @@ src/
 ├── db/               # Database logic
 │   ├── manager.rs    # Instance lifecycle
 │   ├── query.rs      # Query execution
-│   └── dialects/     # MySQL, SQL Server implementations
+│   └── dialects/     # MySQL, SQL Server, Oracle implementations
 ├── docker/           # Container management (Bollard)
 ├── storage/          # Metadata (SQLite) & backups (R2)
 └── config.rs         # Environment configuration
@@ -139,7 +139,7 @@ src/
 
 **Key Design Decisions:**
 - **Container Pooling**: One container per dialect hosts multiple databases for fast creation
-- **CLI Execution**: Uses `docker exec` with native CLI tools (mysql, sqlcmd) instead of drivers
+- **CLI Execution**: Uses `docker exec` with native CLI tools (mysql, sqlcmd, sqlplus) instead of drivers
 - **SSE Streaming**: Real-time output for long-running queries
 - **UUID Security**: Database IDs are unguessable UUIDs - no auth needed
 
@@ -149,6 +149,7 @@ src/
 |---------|--------|-------|
 | MySQL 8 | Stable | Full support |
 | SQL Server | Stable | x86-64 only |
+| Oracle Free | Stable | ARM64 support from 23.5+, uses PDB schema isolation |
 | PostgreSQL | Planned | |
 | SQLite | Planned | |
 

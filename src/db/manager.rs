@@ -86,6 +86,17 @@ impl InstanceManager {
             )
             .await?;
 
+        // Save metadata immediately with "starting" status so recovery can find it
+        let pool = PoolContainer {
+            dialect: dialect_name.to_string(),
+            container_id: container_id.clone(),
+            host_port,
+            root_password: root_password.clone(),
+            created_at: chrono::Utc::now(),
+            status: "starting".to_string(),
+        };
+        self.metadata.upsert_pool_container(&pool)?;
+
         // Wait for database to be ready (using a simple health check)
         let timeout = Duration::from_secs(dialect.startup_timeout_secs());
         info!("Waiting for pool container {} to be ready...", dialect_name);
@@ -96,12 +107,14 @@ impl InstanceManager {
 
         if !ready {
             warn!("Pool container {} failed to become ready, cleaning up", dialect_name);
+            let _ = self.metadata.delete_pool_container(dialect_name);
             let _ = self.docker.destroy_container(&container_id).await;
             return Err(AppError::Internal(
                 format!("Pool container for {} failed to start within timeout", dialect_name),
             ));
         }
 
+        // Update status to running now that it's ready
         let pool = PoolContainer {
             dialect: dialect_name.to_string(),
             container_id: container_id.clone(),
@@ -110,7 +123,6 @@ impl InstanceManager {
             created_at: chrono::Utc::now(),
             status: "running".to_string(),
         };
-
         self.metadata.upsert_pool_container(&pool)?;
         info!("Pool container for {} ready on port {}", dialect_name, host_port);
 
@@ -761,10 +773,46 @@ impl InstanceManager {
             // Check if pool container still exists and is running
             match self.docker.is_running(&pool.container_id).await {
                 Ok(true) => {
-                    info!(
-                        "Pool container for {} recovered on port {}",
-                        pool.dialect, pool.host_port
-                    );
+                    // If pool was in "starting" state, wait for it to become ready
+                    if pool.status == "starting" {
+                        info!(
+                            "Pool container for {} was starting, waiting for it to become ready...",
+                            pool.dialect
+                        );
+                        let dialect = get_dialect(&pool.dialect)?;
+                        let timeout = Duration::from_secs(dialect.startup_timeout_secs());
+                        let ready = self
+                            .wait_for_pool_ready(&pool.container_id, dialect.as_ref(), &pool.root_password, timeout)
+                            .await;
+                        if ready {
+                            // Update status to running
+                            let updated_pool = PoolContainer {
+                                dialect: pool.dialect.clone(),
+                                container_id: pool.container_id.clone(),
+                                host_port: pool.host_port,
+                                root_password: pool.root_password.clone(),
+                                created_at: pool.created_at,
+                                status: "running".to_string(),
+                            };
+                            let _ = self.metadata.upsert_pool_container(&updated_pool);
+                            info!(
+                                "Pool container for {} recovered on port {}",
+                                pool.dialect, pool.host_port
+                            );
+                        } else {
+                            warn!(
+                                "Pool container for {} failed to become ready, removing",
+                                pool.dialect
+                            );
+                            let _ = self.metadata.delete_pool_container(&pool.dialect);
+                            let _ = self.docker.destroy_container(&pool.container_id).await;
+                        }
+                    } else {
+                        info!(
+                            "Pool container for {} recovered on port {}",
+                            pool.dialect, pool.host_port
+                        );
+                    }
                 }
                 _ => {
                     // Pool container died - remove from metadata
